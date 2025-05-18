@@ -768,318 +768,259 @@ async function performManualBackup() {
     console.log('[聊天自动备份] Performing manual backup (calling conditional function)');
     try {
          await performBackupConditional(); // Manual backup also goes through conditional check and lock logic
-         toastr.success('Manual backup of current chat completed', 'Chat Auto Backup');
+         toastr.success('当前聊天备份已完成！', '聊天自动备份');
     } catch (error) {
          // The conditional function already shows an error toast, but log here too.
          console.error('[聊天自动备份] Manual backup failed:', error);
     }
 }
 
-
-// --- Restore logic ---
+// --- 恢复逻辑（优化版）---
 async function restoreBackup(backupData) {
-    // --- Entry and basic info extraction ---
-    console.log('[聊天自动备份] Starting backup restore:', { chatKey: backupData.chatKey, timestamp: backupData.timestamp });
-    logDebug('[聊天自动备份] Raw backup data (backup):', JSON.parse(JSON.stringify(backupData))); // Log raw backup data
+    // --- 入口和基本信息提取 ---
+    console.log('[聊天自动备份] 开始备份恢复（优化流程）:', { chatKey: backupData.chatKey, timestamp: backupData.timestamp });
+    logDebug('[聊天自动备份] 原始备份数据（backup）:', JSON.parse(JSON.stringify(backupData)));
 
     const isGroup = backupData.chatKey.startsWith('group_');
     const entityIdMatch = backupData.chatKey.match(
         isGroup
-        ? /group_(\w+)_/ // Match group ID
-        : /^char_(\d+)/  // Match character ID (index)
+        ? /group_(\w+)_/ // 匹配群组ID
+        : /^char_(\d+)/  // 匹配角色ID（索引）
     );
     let entityId = entityIdMatch ? entityIdMatch[1] : null;
-    let targetCharIndex = -1; // Save character index to switch back later
 
     if (!entityId) {
-        console.error('[聊天自动备份] Could not extract character/group ID from backup data:', backupData.chatKey);
-        toastr.error('Could not identify character/group ID for backup');
+        console.error('[聊天自动备份] 无法从备份数据中提取角色/群组ID:', backupData.chatKey);
+        toastr.error('无法识别备份的角色/群组ID');
         return false;
     }
 
-    logDebug(`Restore target: ${isGroup ? 'Group' : 'Character'} ID/Identifier: ${entityId}`);
-
-    // *** Save currently selected entity ID and type to switch back at the end ***
     const entityToRestore = {
         isGroup: isGroup,
         id: entityId,
-        charIndex: -1 // Initialize
+        charIndex: -1, // 初始化
+        // 从备份中存储原始聊天名称，以便在selectCharacterById/select_group_chats中可能需要使用
+        // 目前，newChatId将作为文件的主要标识符
     };
+
     if (!isGroup) {
         entityToRestore.charIndex = parseInt(entityId, 10);
         if (isNaN(entityToRestore.charIndex) || entityToRestore.charIndex < 0 || entityToRestore.charIndex >= characters.length) {
-             console.error(`[聊天自动备份] Invalid character index: ${entityId}`);
-             toastr.error(`Invalid character index ${entityId}`);
+             console.error(`[聊天自动备份] 无效的角色索引: ${entityId}`);
+             toastr.error(`找不到对应角色卡 ${entityId}`);
              return false;
         }
     }
 
+    logDebug(`恢复目标: ${isGroup ? '群组' : '角色'} ID/标识符: ${entityToRestore.id}`);
+
     try {
-        // --- Step 1: Switch context --- (Switch if not already the target; skip if already there)
+        toastr.info(`正在恢复备份，插件将自动接管酒馆界面，尝试聊天记录、记忆表格、作者注释...请耐心等候消息结果！`);
+        // --- 步骤1: 切换上下文（如需要）---
         const initialContext = getContext();
-        logDebug('[聊天自动备份] Step 1 - Before context switch context:', { // Log state before switch
+        logDebug('[聊天自动备份] 步骤1 - 上下文切换前的上下文:', {
             groupId: initialContext.groupId,
             characterId: initialContext.characterId,
             chatId: initialContext.chatId
         });
-        const needsContextSwitch = (isGroup && initialContext.groupId !== entityId) ||
-                                   (!isGroup && String(initialContext.characterId) !== entityId);
+        const needsContextSwitch = (isGroup && initialContext.groupId !== entityToRestore.id) ||
+                                   (!isGroup && String(initialContext.characterId) !== String(entityToRestore.charIndex)); // 比较charIndex
 
         if (needsContextSwitch) {
             try {
-                logDebug('Step 1: Context switch needed, starting switch...');
+                logDebug('步骤1: 需要切换上下文，开始切换...');
                 if (isGroup) {
-                    await select_group_chats(entityId);
+                    await select_group_chats(entityToRestore.id);
                 } else {
                     await selectCharacterById(entityToRestore.charIndex, { switchMenu: false });
                 }
-                // **Key Delay 1.5: Add delay after switching character/group**
-                // SillyTavern will trigger CHAT_CHANGED at this point, give the table plugin some time to process (even if it errors)
-                console.log('[聊天自动备份] Step 1.5: Adding brief delay after context switch...');
-                await new Promise(resolve => setTimeout(resolve, 500)); // Add delay, e.g., 500ms
-                console.log('[聊天自动备份] Step 1.5: Delay ended. Current context:', {
+                // 短暂延迟，让上下文切换完全传播并触发事件
+                await new Promise(resolve => setTimeout(resolve, 200)); // 200毫秒，可调整
+                logDebug('[聊天自动备份] 步骤1: 上下文切换可能已完成。当前上下文:', {
                     groupId: getContext().groupId, characterId: getContext().characterId, chatId: getContext().chatId
                 });
             } catch (switchError) {
-                console.error('[聊天自动备份] Step 1 failed: Failed to switch character/group:', switchError);
-                toastr.error(`Failed to switch context: ${switchError.message || switchError}`);
+                console.error('[聊天自动备份] 步骤1失败: 切换角色/群组失败:', switchError);
+                toastr.error(`切换对应角色卡/群组失败: ${switchError.message || switchError}`);
                 return false;
             }
         } else {
-            logDebug('Step 1: Already in target context, skipping switch');
+            logDebug('步骤1: 已在目标上下文中，跳过切换');
         }
 
-
-        // --- Step 2: Create a new chat ---
-        let originalChatIdBeforeNewChat = getContext().chatId;
-        logDebug('Step 2: Starting new chat creation...');
+        // --- 步骤2: 创建新聊天 ---
+        let originalChatIdBeforeNewChat = getContext().chatId; // 在可能的上下文切换*后*获取聊天ID
+        logDebug('步骤2: 开始创建新聊天...');
         await doNewChat({ deleteCurrentChat: false });
-         // **Key Delay 2.5: Add delay after creating new chat**
-         // SillyTavern will trigger CHAT_CHANGED again here
-        console.log('[聊天自动备份] Step 2.5: Adding brief delay after creating new chat...');
-        await new Promise(resolve => setTimeout(resolve, 1000)); // Add delay, e.g., 1000ms
-        console.log('[聊天自动备份] Step 2.5: Delay ended');
+        // 短暂延迟，让新聊天创建事件处理
+        await new Promise(resolve => setTimeout(resolve, 200)); // 200毫秒，可调整
+        logDebug('[聊天自动备份] 步骤2: 新聊天创建可能已完成。');
 
 
-        // --- Step 3: Get the new chat ID ---
-        logDebug('Step 3: Getting new chat ID...');
+        // --- 步骤3: 获取新聊天ID ---
+        logDebug('步骤3: 获取新聊天ID...');
         let contextAfterNewChat = getContext();
         const newChatId = contextAfterNewChat.chatId;
 
         if (!newChatId || newChatId === originalChatIdBeforeNewChat) {
-            console.error('[聊天自动备份] Step 3 failed: Could not get a valid new chatId. New ChatID:', newChatId, "Old ChatID:", originalChatIdBeforeNewChat);
-            toastr.error('Could not get ID for the new chat, cannot proceed with restore');
+            console.error('[聊天自动备份] 步骤3失败: 无法获取有效的新chatId。新ChatID:', newChatId, "旧ChatID（创建新聊天前）:", originalChatIdBeforeNewChat);
+            toastr.error('无法获取新聊天的ID，无法继续恢复');
             return false;
         }
-        logDebug(`Step 3: New chat ID: ${newChatId}`);
+        logDebug(`步骤3: 成功获取新聊天ID: ${newChatId}`);
 
-        // --- Step 4: Prepare chat content and metadata ---
-        logDebug('Step 4: Preparing chat content and metadata in memory...');
+        // --- 步骤4: 准备聊天内容和元数据以保存 ---
+        logDebug('步骤4: 在内存中准备聊天内容和元数据...');
         const chatToSave = structuredClone(backupData.chat);
-        // **Restore the standard chat metadata from backup**
-        let metadataToSave = structuredClone(backupData.metadata || {}); // Use the standard metadata from backup
-        console.log('[聊天自动备份] Step 4 - Chat messages to save (first 2):', chatToSave.slice(0, Math.min(chatToSave.length, 2)));
-        console.log('[聊天自动备份] Step 4 - Metadata to save:', JSON.parse(JSON.stringify(metadataToSave)));
+        let metadataToSave = structuredClone(backupData.metadata || {});
+        console.log('[聊天自动备份] 步骤4 - 要保存的聊天消息（前2条）:', chatToSave.slice(0, Math.min(chatToSave.length, 2)));
+        console.log('[聊天自动备份] 步骤4 - 要保存的元数据（来自备份的初始数据）:', JSON.parse(JSON.stringify(metadataToSave)));
 
-        // Check for standard metadata sheets
+        // 确保如果存在tablePluginExportData，则metadataToSave.sheets存在，
+        // 因为TablePluginBASE.applyJsonToChatSheets可能依赖于基本结构。
+        if (backupData.tablePluginExportData && (!metadataToSave.sheets || !Array.isArray(metadataToSave.sheets))) {
+            metadataToSave.sheets = []; // 如果不存在或不是数组，则初始化为空数组
+            logDebug('[聊天自动备份] 步骤4: 由于tablePluginExportData存在，已将metadataToSave.sheets初始化为空数组。');
+        }
         if (metadataToSave.sheets) {
-            console.log('[聊天自动备份] Step 4 - Restored metadata includes sheets definition (standard format):', JSON.parse(JSON.stringify(metadataToSave.sheets)));
-        } else {
-            console.warn('[聊天自动备份] Step 4 - Warning: Restored metadata does NOT include sheets definition (standard format)!');
-        }
-        // Check for tablePluginExportData (the import/export format)
-        if (backupData.tablePluginExportData) {
-             console.log('[聊天自动备份] Step 4 - Backup data includes tablePluginExportData (import/export format).');
-        } else {
-             console.warn('[聊天自动备份] Step 4 - Warning: Backup data does NOT include tablePluginExportData (import/export format). Table restore might fail.');
+            logDebug('[聊天自动备份] 步骤4 - 保存前的最终metadataToSave.sheets:', JSON.parse(JSON.stringify(metadataToSave.sheets)));
         }
 
 
-        logDebug(`Step 4: Preparation complete, message count: ${chatToSave.length}, Metadata:`, JSON.parse(JSON.stringify(metadataToSave)));
-
-        // --- Step 5: Save the restored data to the new chat file ---
-        // We will temporarily replace the global chat and chatMetadata to save the file.
-        logDebug(`Step 5: Temporarily replacing global chat and chatMetadata for saving...`);
-        let globalContext = getContext();
+        // --- 步骤5: 将恢复的数据保存到新聊天文件 ---
+        logDebug(`步骤5: 临时替换全局聊天和chatMetadata以保存到新聊天文件: ${newChatId}`);
+        let globalContext = getContext(); // 修改前再次getContext()
         let originalGlobalChat = globalContext.chat.slice();
-        // Backup the current standard chatMetadata
         let originalGlobalMetadata = structuredClone(globalContext.chatMetadata);
-        console.log('[聊天自动备份] Step 5 - Global chatMetadata before saving:', JSON.parse(JSON.stringify(originalGlobalMetadata)));
+        logDebug('[聊天自动备份] 步骤5 - 临时替换前的全局chatMetadata:', JSON.parse(JSON.stringify(originalGlobalMetadata)));
 
-        // Replace global chat and chatMetadata with the restored data
+        // 用恢复的数据替换全局聊天和chatMetadata
         globalContext.chat.length = 0;
         chatToSave.forEach(msg => globalContext.chat.push(msg));
-        // **Key: Directly replace chatMetadata, bypassing the table plugin's Proxy during this step**
-        globalContext.chatMetadata = metadataToSave;
-        console.log('[聊天自动备份] Step 5 - Global chatMetadata replaced with restored metadata (direct assignment):', JSON.parse(JSON.stringify(globalContext.chatMetadata)));
-        // Re-check sheets state after direct assignment
-        if (globalContext.chatMetadata && globalContext.chatMetadata.sheets) {
-             console.log('[聊天自动备份] Step 5 - After direct assignment, global chatMetadata.sheets:', JSON.parse(JSON.stringify(globalContext.chatMetadata.sheets)));
-        } else {
-             console.warn('[聊天自动备份] Step 5 - Warning: After direct assignment, global chatMetadata.sheets not found or empty!');
-        }
+        globalContext.chatMetadata = metadataToSave; // 直接分配准备好的元数据
+        logDebug('[聊天自动备份] 步骤5 - 全局chatMetadata临时替换为恢复的元数据:', JSON.parse(JSON.stringify(globalContext.chatMetadata)));
 
-
-        logDebug(`Step 5: Calling saveChat({ chatName: ${newChatId}, force: true }) to save restored data...`);
         try {
-            // Save the chat file with the restored chat and chatMetadata
-            await saveChat({ chatName: newChatId, force: true });
-            logDebug('Step 5: saveChat call completed');
-             // **Key Delay 5.5: Add brief delay after saveChat to ensure file write is complete**
-            console.log('[聊天自动备份] Step 5.5: Adding brief delay after saveChat...');
-            await new Promise(resolve => setTimeout(resolve, 200)); // Add delay, e.g., 200ms
-            console.log('[聊天自动备份] Step 5.5: Delay ended');
+            logDebug(`步骤5: 调用saveChat({ chatName: "${newChatId}", force: true })保存恢复的数据...`);
+            await saveChat({ chatName: newChatId, force: true }); // 保存到特定的新聊天ID
+            logDebug('步骤5: saveChat调用成功完成。');
+            // 短暂延迟，让文件系统操作稳定
+            await new Promise(resolve => setTimeout(resolve, 200)); // 200毫秒
         } catch (saveError) {
-            console.error("[聊天自动备份] Step 5 failed: Error during saveChat call:", saveError);
-            toastr.error(`Failed to save restored chat: ${saveError.message}`, 'Chat Auto Backup');
-            // Restore global state (using direct assignment)
-            globalContext.chat.length = 0;
-            originalGlobalChat.forEach(msg => globalContext.chat.push(msg));
-            globalContext.chatMetadata = originalGlobalMetadata; // Restore original metadata
-            console.warn('[聊天自动备份] Step 5 - After saveChat failure, global state restored (direct assignment).');
-            return false; // Indicate failure
+            console.error("[聊天自动备份] 步骤5失败: saveChat调用期间出错:", saveError);
+            toastr.error(`保存恢复的新聊天失败: ${saveError.message}`, '聊天自动备份');
+            return false; // 严重失败
         } finally {
-             // Restore global state (using direct assignment)
+             // 恢复全局状态（关键）
              globalContext.chat.length = 0;
              originalGlobalChat.forEach(msg => globalContext.chat.push(msg));
-             globalContext.chatMetadata = originalGlobalMetadata; // Restore original metadata
-             logDebug('Step 5: Global chat and chatMetadata restored to pre-save state (direct assignment)');
+             globalContext.chatMetadata = originalGlobalMetadata;
+             logDebug('步骤5: 全局聊天和chatMetadata已恢复到保存前的状态。');
         }
 
-        // --- Step 6: Force reload - by closing and reopening ---
-        console.log('[聊天自动备份] Step 6: Starting force reload process (close and reopen)...');
+        // --- 步骤6: 显式重新加载新保存的聊天并应用的表格数据 ---
+        console.log('[聊天自动备份] 步骤6: 重新加载新聊天并应用表格数据...');
+
+        // 6a: 触发SillyTavern重新加载/选择此特定新聊天文件。
+        // 这将触发CHAT_CHANGED，其他插件（如表格插件）将做出反应。
+        // 表格插件应该根据文件中的chatMetadata.sheets初始化其基本Sheet实例。
+        logDebug(`[聊天自动备份] 步骤6a: 显式选择/重新加载带有新聊天ID的目标实体: "${newChatId}"`);
         try {
-            // 6a: Trigger close chat (simulate click)
-            console.log("[聊天自动备份] Step 6a: Triggering 'Close Chat'");
-            const closeButton = document.getElementById('option_close_chat');
-            if (closeButton) closeButton.click();
-            else console.warn("[聊天自动备份] Could not find #option_close_chat button");
-            await new Promise(resolve => setTimeout(resolve, 800)); // Wait for close animation/state update
-
-            // 6b: Trigger re-selection of the target entity (This will trigger a new CHAT_CHANGED event and load chatMetadata from the file)
-            console.log(`[聊天自动备份] Step 6b: Re-selecting target entity ID: ${entityToRestore.id}. This will load the newly saved chat file.`);
             if (entityToRestore.isGroup) {
-                await select_group_chats(entityToRestore.id);
+                // 对于群组，openGroupChat处理设置活动chat_id并加载它。
+                await openGroupChat(entityToRestore.id, newChatId);
             } else {
-                 // Re-selecting character. SillyTavern should load the latest created/saved chat for that character.
-                 await selectCharacterById(entityToRestore.charIndex, { switchMenu: false });
+                // 对于角色，带有chatFile选项的selectCharacterById是首选。
+                // 或者如果只有文件名可用，则使用openCharacterChat（这里newChatId是文件名）
+                await selectCharacterById(entityToRestore.charIndex, { switchMenu: false, chatFile: newChatId });
+                // 替代方案: await openCharacterChat(newChatId);
             }
-
-            // **Key Delay 6.5 (Most Important Delay): Wait for environment to stabilize after reload**
-            // This delay gives SillyTavern enough time to process the automatic CHAT_CHANGED event
-            // and for the environment (including getContext) to become stable.
-            console.log('[聊天自动备份] Step 6.5: Waiting for SillyTavern to complete chat load and UI stabilization...');
-            await new Promise(resolve => setTimeout(resolve, 3000)); // 3 seconds delay (adjust if needed)
-            console.log('[聊天自动备份] Step 6.5: Delay ended. Current context:', {
-                 groupId: getContext().groupId, characterId: getContext().characterId, chatId: getContext().chatId, chatMetadata: getContext().chatMetadata ? '...' : 'undefined'
-            });
-
-            // **Confirm chatMetadata.sheets is loaded (this is the standard format from the file)**
-            const loadedContext = getContext();
-            if (loadedContext.chatMetadata && loadedContext.chatMetadata.sheets) {
-                console.log('[聊天自动备份] Step 6.5 - After delay, current chatMetadata sheets (loaded from file) confirmed to exist.');
-                console.log('[聊天自动备份] Step 6.5 - Loaded chatMetadata.sheets:', JSON.parse(JSON.stringify(loadedContext.chatMetadata.sheets)));
-
-
-                // **CORE ATTEMPT: Use the backed-up tablePluginExportData (import/export format) via the table plugin's import logic**
-                if (backupData.tablePluginExportData) {
-                    console.log('[聊天自动备份] Step 6.6: Found tablePluginExportData in backup, attempting to restore via table plugin import logic...');
-                    console.log('[聊天自动备份] Step 6.6: Data to be imported:', JSON.parse(JSON.stringify(backupData.tablePluginExportData)));
-
-                    // **Key: Call TablePluginBASE.applyJsonToChatSheets**
-                    // This method takes the import/export format JSON and applies it.
-                    // It should rebuild the Sheet instances correctly using the 'content' data.
-                    let importSuccessful = false;
-                    try {
-                        // Check if TablePluginBASE and applyJsonToChatSheets are available
-                        if (TablePluginBASE && typeof TablePluginBASE.applyJsonToChatSheets === 'function') {
-                             console.log('[聊天自动备份] Step 6.6: Attempting to call TablePluginBASE.applyJsonToChatSheets...');
-                             // "both" attempts to update existing sheet definitions and import data
-                             // This seems appropriate for fully restoring the state from the export format.
-                             await TablePluginBASE.applyJsonToChatSheets(backupData.tablePluginExportData, "both");
-                             console.log('[聊天自动备份] Step 6.6: TablePluginBASE.applyJsonToChatSheets call completed.');
-                             importSuccessful = true;
-                        } else {
-                             console.warn('[聊天自动备份] Step 6.6: Cannot access TablePluginBASE.applyJsonToChatSheets method.');
-                        }
-                    } catch (importError) {
-                        console.error('[聊天自动备份] Step 6.6: Error occurred during TablePluginBASE.applyJsonToChatSheets call:', importError);
-                    }
-
-
-                    // After attempting import, trigger a UI refresh
-                    // This is needed to make the UI render the Sheet instances that were just potentially rebuilt by applyJsonToChatSheets
-                    if (typeof tablePlugin_refreshContextView === 'function') {
-                        console.log('[聊天自动备份] Step 6.7: Calling tablePlugin_refreshContextView()...');
-                        await tablePlugin_refreshContextView();
-                        console.log('[聊天自动备份] Step 6.7: tablePlugin_refreshContextView call completed.');
-                    } else {
-                         const tableDrawerButton = document.getElementById('table_drawer_icon');
-                         if (tableDrawerButton) {
-                             console.log('[聊天自动备份] Step 6.7: Simulating click on #table_drawer_icon...');
-                             tableDrawerButton.click();
-                              // Optional: Add a small delay and click again to close the drawer if it opened
-                              // setTimeout(() => tableDrawerButton.click(), 500);
-                         } else {
-                              console.warn('[聊天自动备份] Step 6.7: refreshContextView and #table_drawer_icon are both unavailable.');
-                         }
-                    }
-
-                    if (importSuccessful) {
-                        toastr.success('Chat history restored, table data attempted to restore via plugin import logic.', 'Chat Auto Backup');
-                    } else {
-                        // If import failed, the standard chatMetadata might still render something (empty structure)
-                        // Or the user needs manual intervention.
-                       toastr.warning('Chat history restored, but table data might not be fully restored. Please check the table or try manual import of backup file.', 'Chat Auto Backup');
-                    }
-
-                } else {
-                    console.warn('[聊天自动备份] Step 6.6: tablePluginExportData not found in backup data. Cannot restore table via import logic.');
-                    // Fallback to just refreshing the view based on standard chatMetadata load
-                    console.log('[聊天自动备份] Step 6.6: Falling back to refreshing view based on standard chatMetadata load...');
-                    if (typeof tablePlugin_refreshContextView === 'function') {
-                        await tablePlugin_refreshContextView();
-                    } else {
-                         const tableDrawerButton = document.getElementById('table_drawer_icon');
-                         if (tableDrawerButton) tableDrawerButton.click();
-                    }
-                    toastr.warning('Chat history restored, but table data might not be displayed correctly (export data missing).', 'Chat Auto Backup');
-                }
-
-
-            } else {
-                 console.error('[聊天自动备份] Step 6.5 - Error: After delay, current chatMetadata sheets (loaded from file) not found or empty!');
-                 toastr.error('Restored chat data did not contain table information, table might not be displayed.', 'Chat Auto Backup');
-                 // Even if reload fails, attempt to trigger UI refresh based on whatever is in getContext()
-                 const finalContextAfterError = getContext();
-                 if (finalContextAfterError.chatMetadata && finalContextAfterError.chatMetadata.sheets) {
-                     // Try triggering refresh based on loaded (potentially empty) data
-                      if (typeof tablePlugin_refreshContextView === 'function') {
-                           console.log('[聊天自动备份] After reload failure, attempting to call tablePlugin_refreshContextView()...');
-                           tablePlugin_refreshContextView().catch(e => console.error('[聊天自动备份] Error calling refreshContextView after reload failure:', e));
-                      } else if (document.getElementById('table_drawer_icon')) {
-                           console.log('[聊天自动备份] After reload failure, attempting to simulate click on table drawer...');
-                           document.getElementById('table_drawer_icon').click();
-                      } else {
-                           console.warn('[聊天自动备份] After reload failure, cannot trigger table UI refresh.');
-                      }
-                 } else {
-                      console.warn('[聊天自动备份] After reload failure, chatMetadata.sheets also does not exist, cannot attempt to refresh table.');
-                 }
-            }
-
-            // --- End ---
-            console.log('[聊天自动备份] Restore process completed');
-            return true; // Assuming reach here means data was saved/loaded, even if refresh failed
-
-        } catch (error) {
-            console.error('[聊天自动备份] An unexpected serious error occurred during chat restore:', error);
-            toastr.error(`Restore failed: ${error.message || 'Unknown error'}`, 'Chat Auto Backup');
-            return false;
+            logDebug(`[聊天自动备份] 步骤6a: 已发送重新加载/选择聊天"${newChatId}"的命令。`);
+        } catch (reloadError) {
+            console.error(`[聊天自动备份] 步骤6a失败: 显式重新加载/选择聊天"${newChatId}"时出错:`, reloadError);
+            toastr.error(`重新加载新聊天失败: ${reloadError.message || reloadError}。记忆表格数据可能无法恢复。`, '聊天自动备份');
+            // 尝试继续，SillyTavern可能仍然会渲染聊天消息。
         }
+
+        // 6b: CHAT_CHANGED事件传播和表格插件执行初始设置的短暂延迟
+        // 这允许表格插件处理从文件加载的chatMetadata.sheets。
+        console.log('[聊天自动备份] 步骤6b: 等待CHAT_CHANGED传播和表格插件基本初始化...');
+        await new Promise(resolve => setTimeout(resolve, 300)); // 300毫秒，可调整。
+
+        // 6c: 验证上下文并记录文件加载后的sheets状态
+        const loadedContextAfterReload = getContext();
+        if (loadedContextAfterReload.chatId !== newChatId) {
+            console.warn(`[聊天自动备份] 步骤6c警告: 重新加载后，当前chatId (${loadedContextAfterReload.chatId})与预期的newChatId (${newChatId})不匹配。这可能表明存在问题。`);
+            // 不一定在这里失败，但要记录下来。如果上下文基本正确，表格恢复可能仍然有效。
+        } else {
+            logDebug(`[聊天自动备份] 步骤6c: 聊天"${newChatId}"似乎已加载。当前context.chatId: ${loadedContextAfterReload.chatId}`);
+        }
+        if (loadedContextAfterReload.chatMetadata && loadedContextAfterReload.chatMetadata.sheets) {
+            logDebug('[聊天自动备份] 步骤6c - 从文件加载的chatMetadata.sheets:', JSON.parse(JSON.stringify(loadedContextAfterReload.chatMetadata.sheets)));
+        } else {
+            logDebug('[聊天自动备份] 步骤6c - 文件加载后未找到chatMetadata.sheets或为空。');
+        }
+
+        // 6d: 使用tablePluginExportData通过表格插件的API应用详细的表格数据
+        // 这应该在表格插件有机会根据文件的sheet结构初始化后发生。
+        toastr.info('正在尝试恢复记忆表格并渲染（如果有的话）');
+        if (backupData.tablePluginExportData) {
+            logDebug('[聊天自动备份] 步骤6d: 尝试使用tablePluginExportData通过API恢复表格数据...');
+            console.log('[聊天自动备份] 步骤6d: 通过API导入的数据:', JSON.parse(JSON.stringify(backupData.tablePluginExportData)));
+            try {
+                if (TablePluginBASE && typeof TablePluginBASE.applyJsonToChatSheets === 'function') {
+                    // "both"将尝试更新现有定义并导入数据。
+                    await TablePluginBASE.applyJsonToChatSheets(backupData.tablePluginExportData, "both");
+                    logDebug('[聊天自动备份] 步骤6d: TablePluginBASE.applyJsonToChatSheets调用成功完成。');
+                    toastr.info('已通过记忆表格插件API尝试表格数据恢复。', '聊天自动备份', {timeOut: 3000});
+                } else {
+                    console.warn('[聊天自动备份] 步骤6d: TablePluginBASE.applyJsonToChatSheets方法不可用。');
+                    toastr.warning('记忆表格插件API不可用，无法自动恢复详细的表格数据。', '聊天自动备份', {timeOut: 5000});
+                }
+            } catch (importError) {
+                console.error('[聊天自动备份] 步骤6d: TablePluginBASE.applyJsonToChatSheets调用期间出错:', importError);
+                toastr.error('通过记忆表格API恢复详细表格数据时出错。请检查控制台。', '聊天自动备份', {timeOut: 5000});
+            }
+        } else {
+            console.warn('[聊天自动备份] 步骤6d: 在备份中未找到tablePluginExportData。跳过基于API的表格恢复。');
+        }
+
+        // 6e: 刷新表格插件的UI以显示恢复的数据
+        // 这对于用户查看表格数据恢复结果至关重要。
+        logDebug('[聊天自动备份] 步骤6e: 刷新表格插件UI...');
+        if (typeof tablePlugin_refreshContextView === 'function') {
+            try {
+                await tablePlugin_refreshContextView();
+                logDebug('[聊天自动备份] 步骤6e: tablePlugin_refreshContextView调用完成。');
+            } catch (refreshError) {
+                 console.error('[聊天自动备份] 步骤6e: 调用tablePlugin_refreshContextView时出错:', refreshError);
+            }
+        } else {
+            const tableDrawerButton = document.getElementById('table_drawer_icon');
+            if (tableDrawerButton) {
+                 logDebug('[聊天自动备份] 步骤6e: 模拟点击#table_drawer_icon作为备用刷新方法...');
+                 tableDrawerButton.click(); // 打开
+                 // setTimeout(() => tableDrawerButton.click(), 200); // 可选地再次点击以关闭（如果它之前是关闭的）
+            } else {
+                 console.warn('[聊天自动备份] 步骤6e: tablePlugin_refreshContextView和#table_drawer_icon都不可用于UI刷新。');
+            }
+        }
+        toastr.success('已完成记忆表格恢复与渲染流程（如果聊天有记忆表格的话）', '聊天自动备份');
+
+        // --- 步骤7: 完成 ---
+        // SillyTavern将处理渲染主聊天消息（printMessages, scrollChatToBottom）
+        // 作为selectCharacterById/openGroupChat过程的一部分。
+        // 非常短的延迟可以确保DOM操作有机会完成，以获得视觉上的流畅性。
+        await new Promise(resolve => setTimeout(resolve, 200)); // 200毫秒，用于视觉稳定
+
+        console.log('[聊天自动备份] 恢复过程完成（优化流程）');
+        toastr.success('聊天记录已成功恢复。', '聊天自动备份');
+        return true;
+
     } catch (error) {
-        console.error('[聊天自动备份] An unexpected serious error occurred during chat restore:', error);
-        toastr.error(`Restore failed: ${error.message || 'Unknown error'}`, 'Chat Auto Backup');
+        console.error('[聊天自动备份] 聊天恢复过程中发生意外严重错误:', error);
+        toastr.error(`恢复失败: ${error.message || '未知错误'}`, '聊天自动备份');
+        // 考虑是否需要在此处进行任何清理或状态重置，尽管各个步骤都有finally块。
         return false;
     }
 }

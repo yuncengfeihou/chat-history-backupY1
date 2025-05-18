@@ -4,7 +4,7 @@
 // 2. 在插件页面显示保存的记录
 // 3. 提供恢复功能，将保存的聊天记录恢复到新的聊天中F
 // 4. 使用Web Worker优化深拷贝性能
-// 5. 改进表格插件数据备份和恢复，利用表格插件自身的导入/导出机制
+// 5. 利用记忆表格插件自身的导入/导出机制，实现表格的备份与恢复
 
 import {
     getContext,
@@ -152,15 +152,273 @@ function initSettings() {
     return settings;
 }
 
+// --- IndexedDB 相关函数 ---
+function initDatabase() {
+    return new Promise((resolve, reject) => {
+        logDebug('初始化 IndexedDB 数据库');
+        const request = indexedDB.open(DB_NAME, DB_VERSION);
 
-// --- IndexedDB相关函数 (保持不变) ---
-// ... (initDatabase, getDB, saveBackupToDB, getBackupsForChat, getAllBackups, getAllBackupKeys, deleteBackup functions) ...
-// (Copy the IndexedDB functions from your provided index.js here)
+        request.onerror = function(event) {
+            console.error('[聊天自动备份] 打开数据库失败:', event.target.error);
+            reject(event.target.error);
+        };
 
-// --- 聊天信息获取 (保持不变) ---
-// ... (getCurrentChatKey, getCurrentChatInfo functions) ...
-// (Copy the chat info functions from your provided index.js here)
+        request.onsuccess = function(event) {
+            const db = event.target.result;
+            logDebug('数据库打开成功');
+            resolve(db);
+        };
 
+        request.onupgradeneeded = function(event) {
+            const db = event.target.result;
+            console.log('[聊天自动备份] 数据库升级中，创建对象存储');
+            if (!db.objectStoreNames.contains(STORE_NAME)) {
+                const store = db.createObjectStore(STORE_NAME, { keyPath: ['chatKey', 'timestamp'] });
+                store.createIndex('chatKey', 'chatKey', { unique: false });
+                console.log('[聊天自动备份] 创建了备份存储和索引');
+            }
+        };
+    });
+}
+
+// 获取数据库连接 (优化版本 - 使用连接池)
+async function getDB() {
+    try {
+        // 检查现有连接是否可用
+        if (dbConnection && dbConnection.readyState !== 'closed') {
+            return dbConnection;
+        }
+        
+        // 创建新连接
+        dbConnection = await initDatabase();
+        return dbConnection;
+    } catch (error) {
+        console.error('[聊天自动备份] 获取数据库连接失败:', error);
+        throw error;
+    }
+}
+
+// 保存备份到 IndexedDB (优化版本)
+async function saveBackupToDB(backup) {
+    const db = await getDB();
+    try {
+        await new Promise((resolve, reject) => {
+            const transaction = db.transaction([STORE_NAME], 'readwrite');
+            
+            transaction.oncomplete = () => {
+                logDebug(`备份已保存到IndexedDB, 键: [${backup.chatKey}, ${backup.timestamp}]`);
+                resolve();
+            };
+            
+            transaction.onerror = (event) => {
+                console.error('[聊天自动备份] 保存备份事务失败:', event.target.error);
+                reject(event.target.error);
+            };
+            
+            const store = transaction.objectStore(STORE_NAME);
+            store.put(backup);
+        });
+    } catch (error) {
+        console.error('[聊天自动备份] saveBackupToDB 失败:', error);
+        throw error;
+    }
+}
+
+// 从 IndexedDB 获取指定聊天的所有备份
+async function getBackupsForChat(chatKey) {
+    const db = await getDB();
+    try {
+        return await new Promise((resolve, reject) => {
+            const transaction = db.transaction([STORE_NAME], 'readonly');
+            
+            transaction.onerror = (event) => {
+                console.error('[聊天自动备份] 获取备份事务失败:', event.target.error);
+                reject(event.target.error);
+            };
+            
+            const store = transaction.objectStore(STORE_NAME);
+            const index = store.index('chatKey');
+            const request = index.getAll(chatKey);
+            
+            request.onsuccess = () => {
+                const backups = request.result || [];
+                logDebug(`从IndexedDB获取了 ${backups.length} 个备份，chatKey: ${chatKey}`);
+                resolve(backups);
+            };
+            
+            request.onerror = (event) => {
+                console.error('[聊天自动备份] 获取备份失败:', event.target.error);
+                reject(event.target.error);
+            };
+        });
+    } catch (error) {
+        console.error('[聊天自动备份] getBackupsForChat 失败:', error);
+        return []; // 出错时返回空数组
+    }
+}
+
+// 从 IndexedDB 获取所有备份
+async function getAllBackups() {
+    const db = await getDB();
+    try {
+        return await new Promise((resolve, reject) => {
+            const transaction = db.transaction([STORE_NAME], 'readonly');
+            
+            transaction.onerror = (event) => {
+                console.error('[聊天自动备份] 获取所有备份事务失败:', event.target.error);
+                reject(event.target.error);
+            };
+            
+            const store = transaction.objectStore(STORE_NAME);
+            const request = store.getAll();
+            
+            request.onsuccess = () => {
+                const backups = request.result || [];
+                logDebug(`从IndexedDB获取了总共 ${backups.length} 个备份`);
+                resolve(backups);
+            };
+            
+            request.onerror = (event) => {
+                console.error('[聊天自动备份] 获取所有备份失败:', event.target.error);
+                reject(event.target.error);
+            };
+        });
+    } catch (error) {
+        console.error('[聊天自动备份] getAllBackups 失败:', error);
+        return [];
+    }
+}
+
+// 从 IndexedDB 获取所有备份的主键 (优化清理逻辑)
+async function getAllBackupKeys() {
+    const db = await getDB();
+    try {
+        return await new Promise((resolve, reject) => {
+            const transaction = db.transaction([STORE_NAME], 'readonly');
+
+            transaction.onerror = (event) => {
+                console.error('[聊天自动备份] 获取所有备份键事务失败:', event.target.error);
+                reject(event.target.error);
+            };
+
+            const store = transaction.objectStore(STORE_NAME);
+            // 使用 getAllKeys() 只获取主键
+            const request = store.getAllKeys();
+
+            request.onsuccess = () => {
+                // 返回的是键的数组，每个键是 [chatKey, timestamp]
+                const keys = request.result || [];
+                logDebug(`从IndexedDB获取了总共 ${keys.length} 个备份的主键`);
+                resolve(keys);
+            };
+
+            request.onerror = (event) => {
+                console.error('[聊天自动备份] 获取所有备份键失败:', event.target.error);
+                reject(event.target.error);
+            };
+        });
+    } catch (error) {
+        console.error('[聊天自动备份] getAllBackupKeys 失败:', error);
+        return []; // 出错时返回空数组
+    }
+} 
+
+// 从 IndexedDB 删除指定备份
+async function deleteBackup(chatKey, timestamp) {
+    const db = await getDB();
+    try {
+        await new Promise((resolve, reject) => {
+            const transaction = db.transaction([STORE_NAME], 'readwrite');
+            
+            transaction.oncomplete = () => {
+                logDebug(`已从IndexedDB删除备份, 键: [${chatKey}, ${timestamp}]`);
+                resolve();
+            };
+            
+            transaction.onerror = (event) => {
+                console.error('[聊天自动备份] 删除备份事务失败:', event.target.error);
+                reject(event.target.error);
+            };
+            
+            const store = transaction.objectStore(STORE_NAME);
+            store.delete([chatKey, timestamp]);
+        });
+    } catch (error) {
+        console.error('[聊天自动备份] deleteBackup 失败:', error);
+        throw error;
+    }
+}
+
+// --- 聊天信息获取 ---
+function getCurrentChatKey() {
+    const context = getContext();
+    logDebug('获取当前聊天标识符, context:',
+        {groupId: context.groupId, characterId: context.characterId, chatId: context.chatId});
+    if (context.groupId) {
+        const key = `group_${context.groupId}_${context.chatId}`;
+        logDebug('当前是群组聊天，chatKey:', key);
+        return key;
+    } else if (context.characterId !== undefined && context.chatId) { // 确保chatId存在
+        const key = `char_${context.characterId}_${context.chatId}`;
+        logDebug('当前是角色聊天，chatKey:', key);
+        return key;
+    }
+    console.warn('[聊天自动备份] 无法获取当前聊天的有效标识符 (可能未选择角色/群组或聊天)');
+    return null;
+}
+
+function getCurrentChatInfo() {
+    const context = getContext();
+    let chatName = '当前聊天', entityName = '未知';
+
+    if (context.groupId) {
+        const group = context.groups?.find(g => g.id === context.groupId);
+        entityName = group ? group.name : `群组 ${context.groupId}`;
+        chatName = context.chatId || '新聊天'; // 使用更明确的默认名
+        logDebug('获取到群组聊天信息:', {entityName, chatName});
+    } else if (context.characterId !== undefined) {
+        entityName = context.name2 || `角色 ${context.characterId}`;
+        const character = context.characters?.[context.characterId];
+        if (character && context.chatId) {
+             // chat文件名可能包含路径，只取最后一部分
+             const chatFile = character.chat || context.chatId;
+             chatName = chatFile.substring(chatFile.lastIndexOf('/') + 1).replace('.jsonl', '');
+        } else {
+            chatName = context.chatId || '新聊天';
+        }
+        logDebug('获取到角色聊天信息:', {entityName, chatName});
+    } else {
+        console.warn('[聊天自动备份] 无法获取聊天实体信息，使用默认值');
+    }
+
+    return { entityName, chatName };
+}
+
+// --- Web Worker 通信 ---
+// 发送数据到 Worker 并返回包含拷贝后数据的 Promise
+function performDeepCopyInWorker(payload) {
+    return new Promise((resolve, reject) => {
+        if (!backupWorker) {
+            return reject(new Error("Backup worker not initialized."));
+        }
+
+        const currentRequestId = ++workerRequestId;
+        workerPromises[currentRequestId] = { resolve, reject };
+
+        logDebug(`[主线程] 发送数据到 Worker (ID: ${currentRequestId}), Payload size: ${JSON.stringify(payload).length}`);
+        try {
+            // 发送需要拷贝的数据
+            backupWorker.postMessage({
+                id: currentRequestId,
+                payload: payload
+            });
+        } catch (error) {
+             console.error(`[主线程] 发送消息到 Worker 失败 (ID: ${currentRequestId}):`, error);
+             delete workerPromises[currentRequestId];
+             reject(error);
+        }
+    });
+}
 
 // --- 核心备份逻辑封装 (接收具体数据) ---
 async function executeBackupLogic_Core(chat, chat_metadata_to_backup, settings) {
@@ -396,18 +654,8 @@ async function performBackupConditional() {
     clearTimeout(backupTimeout); // Cancel any pending debounced backups
     backupTimeout = null;
 
-    try {
-        // Calling saveChatConditional() to ensure metadata is potentially updated
-        // This might trigger the table plugin's logic and potentially errors, but it's part of standard flow.
-        logDebug('Attempting to call saveChatConditional() to refresh metadata...');
-        console.log('[聊天自动备份] Before saveChatConditional', getContext().chatMetadata);
-        await saveChatConditional();
-        await new Promise(resolve => setTimeout(resolve, 100)); // Small delay
-        logDebug('saveChatConditional() call completed, proceeding to get context');
-        console.log('[聊天自动备份] After saveChatConditional', getContext().chatMetadata);
-    } catch (e) {
-        console.warn('[聊天自动备份] Error occurred while calling saveChatConditional (might be harmless):', e);
-    }
+    // 插件应该专注于从当前系统状态获取数据并创建备份，而不应该尝试控制或依赖SillyTavern的保存机制。
+    // 因此，我们不再尝试调用saveChatConditional()，而是直接从当前上下文获取数据。
 
     const context = getContext();
     const chatKey = getCurrentChatKey();
@@ -451,6 +699,7 @@ async function performBackupConditional() {
         const { chat } = context;
         const chat_metadata_to_backup = context.chatMetadata; // This is the standard chatMetadata
 
+        // Execute the core backup logic
         // Execute the core backup logic
         const success = await executeBackupLogic_Core(chat, chat_metadata_to_backup, currentSettings);
         if (success) {
@@ -506,7 +755,9 @@ function performBackupDebounced() {
 
         logDebug(`Executing delayed backup operation (from debounce), ChatKey: ${currentChatKey}`);
         // Only perform conditional backup if context matches
-        await performBackupConditional();
+        await performBackupConditional().catch(error => {
+            console.error(`[聊天自动备份] 防抖备份事件 ${currentChatKey} 处理失败:`, error);
+        });
         backupTimeout = null; // Clear the timer ID
     }, delay);
 }
@@ -817,554 +1068,598 @@ async function restoreBackup(backupData) {
                  }
             }
 
-            // --- Step 7: (Remove manual CHAT_CHANGED triggers) ---
-            console.log('[聊天自动备份] Restore process is nearing completion.');
-
             // --- End ---
             console.log('[聊天自动备份] Restore process completed');
-            return true; // Assuming reach here means data was saved/loaded, even if refresh failed. Adjust return value if needed.
+            return true; // Assuming reach here means data was saved/loaded, even if refresh failed
 
         } catch (error) {
             console.error('[聊天自动备份] An unexpected serious error occurred during chat restore:', error);
             toastr.error(`Restore failed: ${error.message || 'Unknown error'}`, 'Chat Auto Backup');
             return false;
         }
+    } catch (error) {
+        console.error('[聊天自动备份] An unexpected serious error occurred during chat restore:', error);
+        toastr.error(`Restore failed: ${error.message || 'Unknown error'}`, 'Chat Auto Backup');
+        return false;
+    }
+}
+
+// --- 更新备份列表UI ---
+async function updateBackupsList() {
+    console.log('[聊天自动备份] 开始更新备份列表UI');
+    const backupsContainer = $('#chat_backup_list');
+    if (!backupsContainer.length) {
+        console.warn('[聊天自动备份] 找不到备份列表容器元素 #chat_backup_list');
+        return;
     }
 
-    // --- UI Update (Keep unchanged) ---
-    // ... (updateBackupsList function) ...
-    // (Copy the updateBackupsList function from your provided index.js here)
+    backupsContainer.html('<div class="backup_empty_notice">正在加载备份...</div>');
 
+    try {
+        const allBackups = await getAllBackups();
+        backupsContainer.empty(); // 清空
 
-    // --- Initialization and Event Binding ---
-    jQuery(async () => {
-        console.log('[聊天自动备份] Plugin loading...');
+        if (allBackups.length === 0) {
+            backupsContainer.append('<div class="backup_empty_notice">暂无保存的备份</div>');
+            return;
+        }
 
-        // Initialize settings
-        const settings = initSettings();
+        // 按时间降序排序
+        allBackups.sort((a, b) => b.timestamp - a.timestamp);
+        logDebug(`渲染 ${allBackups.length} 个备份`);
 
+        allBackups.forEach(backup => {
+            const date = new Date(backup.timestamp);
+            // 使用更可靠和本地化的格式
+            const formattedDate = date.toLocaleString(undefined, { dateStyle: 'short', timeStyle: 'medium' });
+
+            const backupItem = $(`
+                <div class="backup_item">
+                    <div class="backup_info">
+                        <div class="backup_header">
+                            <span class="backup_entity" title="${backup.entityName}">${backup.entityName || '未知实体'}</span>
+                            <span class="backup_chat" title="${backup.chatName}">${backup.chatName || '未知聊天'}</span>
+                        </div>
+                         <div class="backup_details">
+                            <span class="backup_mesid">消息数: ${backup.lastMessageId + 1}</span>
+                            <span class="backup_date">${formattedDate}</span>
+                        </div>
+                        <div class="backup_preview" title="${backup.lastMessagePreview}">${backup.lastMessagePreview}...</div>
+                    </div>
+                    <div class="backup_actions">
+                        <button class="menu_button backup_preview_btn" title="预览此备份的最后两条消息" data-timestamp="${backup.timestamp}" data-key="${backup.chatKey}">预览</button>
+                        <button class="menu_button backup_restore" title="恢复此备份到新聊天" data-timestamp="${backup.timestamp}" data-key="${backup.chatKey}">恢复</button>
+                        <button class="menu_button danger_button backup_delete" title="删除此备份" data-timestamp="${backup.timestamp}" data-key="${backup.chatKey}">删除</button>
+                    </div>
+                </div>
+            `);
+            backupsContainer.append(backupItem);
+        });
+
+        console.log('[聊天自动备份] 备份列表渲染完成');
+    } catch (error) {
+        console.error('[聊天自动备份] 更新备份列表失败:', error);
+        backupsContainer.html(`<div class="backup_empty_notice">加载备份列表失败: ${error.message}</div>`);
+    }
+}
+
+// --- 初始化与事件绑定 ---
+jQuery(async () => {
+    console.log('[聊天自动备份] 插件开始加载...');
+
+    // 初始化设置
+    const settings = initSettings();
+
+    // 防止重复初始化的标志位
+    let isInitialized = false;
+
+    // --- 将各个初始化步骤拆分成独立函数 ---
+    
+    // 初始化数据库
+    const initializeDatabase = async () => {
+        console.log('[聊天自动备份] 初始化数据库');
         try {
-            // Initialize database
             await initDatabase();
+            return true;
+        } catch (error) {
+            console.error('[聊天自动备份] 数据库初始化失败:', error);
+            return false;
+        }
+    };
+    
+    // 初始化Web Worker
+    const initializeWebWorker = () => {
+        console.log('[聊天自动备份] 初始化Web Worker');
+        try {
+            const blob = new Blob([deepCopyLogicString], { type: 'application/javascript' });
+            backupWorker = new Worker(URL.createObjectURL(blob));
+            console.log('[聊天自动备份] Web Worker 已创建');
 
-            // --- Create Web Worker ---
-            try {
-                 // Create Worker from the code string
-                const blob = new Blob([deepCopyLogicString], { type: 'application/javascript' });
-                backupWorker = new Worker(URL.createObjectURL(blob));
-                console.log('[聊天自动备份] Web Worker created');
-
-                // Set Worker message handler (main thread)
-                backupWorker.onmessage = function(e) {
-                    const { id, result, error } = e.data;
-                    // logDebug(`[主线程] Received message from Worker (ID: ${id})`); // Log removed for less noise
-                    if (workerPromises[id]) {
-                        if (error) {
-                            console.error(`[主线程] Worker returned error (ID: ${id}):`, error);
-                            workerPromises[id].reject(new Error(error));
-                        } else {
-                            // logDebug(`[主线程] Worker returned result (ID: ${id})`); // Log removed for less noise
-                            workerPromises[id].resolve(result);
-                        }
-                        delete workerPromises[id]; // Clean up Promise record
+            // 设置 Worker 消息处理器 (主线程)
+            backupWorker.onmessage = function(e) {
+                const { id, result, error } = e.data;
+                if (workerPromises[id]) {
+                    if (error) {
+                        console.error(`[主线程] Worker 返回错误 (ID: ${id}):`, error);
+                        workerPromises[id].reject(new Error(error));
                     } else {
-                         console.warn(`[主线程] Received unknown or already processed Worker message (ID: ${id})`);
+                        workerPromises[id].resolve(result);
                     }
-                };
+                    delete workerPromises[id]; // 清理 Promise 记录
+                } else {
+                     console.warn(`[主线程] 收到未知或已处理的 Worker 消息 (ID: ${id})`);
+                }
+            };
 
-                // Set Worker error handler (main thread)
-                backupWorker.onerror = function(error) {
-                    console.error('[聊天自动备份] Web Worker encountered an error:', error);
-                     // Reject any pending promises
-                     Object.keys(workerPromises).forEach(id => {
-                         workerPromises[id].reject(new Error('Worker encountered an unrecoverable error.'));
-                         delete workerPromises[id];
-                     });
-                    toastr.error('Backup Worker encountered an error, automatic backup may be stopped', 'Chat Auto Backup');
-                     // Consider attempting to recreate the Worker here
-                };
-
-            } catch (workerError) {
-                console.error('[聊天自动备份] Failed to create Web Worker:', workerError);
-                backupWorker = null; // Ensure worker instance is null
-                toastr.error('Failed to create backup Worker, falling back to main thread backup (lower performance)', 'Chat Auto Backup');
-                // In this case, performDeepCopyInWorker needs a fallback mechanism (or the plugin should be disabled/error)
-                // For now, simplified handling: If Worker creation fails, backup functionality will error if it tries to use it.
-            }
-
-
-            // Load plugin UI
+            // 设置 Worker 错误处理器 (主线程)
+            backupWorker.onerror = function(error) {
+                console.error('[聊天自动备份] Web Worker 发生错误:', error);
+                 // 拒绝所有待处理的 Promise
+                 Object.keys(workerPromises).forEach(id => {
+                     workerPromises[id].reject(new Error('Worker encountered an unrecoverable error.'));
+                     delete workerPromises[id];
+                 });
+                toastr.error('备份 Worker 发生错误，自动备份可能已停止', '聊天自动备份');
+            };
+            
+            return true;
+        } catch (workerError) {
+            console.error('[聊天自动备份] 创建 Web Worker 失败:', workerError);
+            backupWorker = null; // 确保 worker 实例为空
+            toastr.error('无法创建备份 Worker，将回退到主线程备份（性能较低）', '聊天自动备份');
+            return false;
+        }
+    };
+    
+    // 加载插件UI
+    const initializePluginUI = async () => {
+        console.log('[聊天自动备份] 初始化插件UI');
+        try {
+            // 加载模板
             const settingsHtml = await renderExtensionTemplateAsync(
                 `third-party/${PLUGIN_NAME}`,
                 'settings'
             );
             $('#extensions_settings').append(settingsHtml);
-            console.log('[聊天自动备份] Settings UI added');
+            console.log('[聊天自动备份] 已添加设置界面');
 
-            // Set up control items
+            // 设置控制项
             const $settingsBlock = $('<div class="chat_backup_control_item"></div>');
             $settingsBlock.html(`
                 <div style="margin-bottom: 8px;">
-                    <label style="display: inline-block; min-width: 120px;">Debounce Delay (ms):</label>
-                    <input type="number" id="chat_backup_debounce_delay" value="${settings.backupDebounceDelay}"
-                        min="300" max="30000" step="100" title="After editing or deleting a message, wait this many milliseconds before performing a backup (suggested 1000-1500)"
+                    <label style="display: inline-block; min-width: 120px;">防抖延迟 (ms):</label>
+                    <input type="number" id="chat_backup_debounce_delay" value="${settings.backupDebounceDelay}" 
+                        min="300" max="30000" step="100" title="编辑或删除消息后，等待多少毫秒再执行备份 (建议 1000-1500)" 
                         style="width: 80px;" />
                 </div>
                 <div>
-                    <label style="display: inline-block; min-width: 120px;">Max Total Backups:</label>
-                    <input type="number" id="chat_backup_max_total" value="${settings.maxTotalBackups}"
-                        min="1" max="50" step="1" title="Maximum number of backups to keep across all chats in the system"
+                    <label style="display: inline-block; min-width: 120px;">系统最大备份数:</label>
+                    <input type="number" id="chat_backup_max_total" value="${settings.maxTotalBackups}" 
+                        min="1" max="50" step="1" title="系统中保留的最大备份数量" 
                         style="width: 80px;" />
                 </div>
             `);
             $('.chat_backup_controls').prepend($settingsBlock);
+            
+            return true;
+        } catch (error) {
+            console.error('[聊天自动备份] 初始化插件UI失败:', error);
+            return false;
+        }
+    };
+    
+    // 设置UI控件事件监听
+    const setupUIEvents = () => {
+        console.log('[聊天自动备份] 设置UI事件监听');
+        
+        // 添加最大备份数设置监听
+        $(document).on('input', '#chat_backup_max_total', function() {
+            const total = parseInt($(this).val(), 10);
+            if (!isNaN(total) && total >= 1 && total <= 50) {
+                settings.maxTotalBackups = total;
+                logDebug(`系统最大备份数已更新为: ${total}`);
+                saveSettingsDebounced();
+            } else {
+                logDebug(`无效的系统最大备份数输入: ${$(this).val()}`);
+                $(this).val(settings.maxTotalBackups);
+            }
+        });
 
-            // Add Max Backups setting listener
-            $(document).on('input', '#chat_backup_max_total', function() {
-                const total = parseInt($(this).val(), 10);
-                if (!isNaN(total) && total >= 1 && total <= 50) {
-                    settings.maxTotalBackups = total;
-                    logDebug(`System max backups updated to: ${total}`);
-                    saveSettingsDebounced();
-                } else {
-                    logDebug(`Invalid system max backups input: ${$(this).val()}`);
-                    $(this).val(settings.maxTotalBackups); // Revert to current setting
-                }
-            });
+        // --- 使用事件委托绑定UI事件 ---
+        $(document).on('click', '#chat_backup_manual_backup', performManualBackup);
 
-            // --- Use event delegation to bind UI events ---
-            $(document).on('click', '#chat_backup_manual_backup', performManualBackup);
+        // 防抖延迟设置
+        $(document).on('input', '#chat_backup_debounce_delay', function() {
+            const delay = parseInt($(this).val(), 10);
+            if (!isNaN(delay) && delay >= 300 && delay <= 30000) {
+                settings.backupDebounceDelay = delay;
+                logDebug(`防抖延迟已更新为: ${delay}ms`);
+                saveSettingsDebounced();
+            } else {
+                logDebug(`无效的防抖延迟输入: ${$(this).val()}`);
+                $(this).val(settings.backupDebounceDelay);
+            }
+        });
 
-            // Debounce delay setting
-            $(document).on('input', '#chat_backup_debounce_delay', function() {
-                const delay = parseInt($(this).val(), 10);
-                if (!isNaN(delay) && delay >= 300 && delay <= 30000) {
-                    settings.backupDebounceDelay = delay;
-                    logDebug(`Debounce delay updated to: ${delay}ms`);
-                    saveSettingsDebounced();
-                } else {
-                    logDebug(`Invalid debounce delay input: ${$(this).val()}`);
-                    $(this).val(settings.backupDebounceDelay); // Revert to current setting
-                }
-            });
+        // 恢复按钮
+        $(document).on('click', '.backup_restore', async function() {
+            const button = $(this);
+            const timestamp = parseInt(button.data('timestamp'));
+            const chatKey = button.data('key');
+            logDebug(`点击恢复按钮, timestamp: ${timestamp}, chatKey: ${chatKey}`);
 
-            // Restore button
-            $(document).on('click', '.backup_restore', async function() {
-                const button = $(this);
-                const timestamp = parseInt(button.data('timestamp'));
-                const chatKey = button.data('key');
-                logDebug(`Restore button clicked, timestamp: ${timestamp}, chatKey: ${chatKey}`);
+            button.prop('disabled', true).text('恢复中...'); // 禁用按钮并显示状态
 
-                button.prop('disabled', true).text('Restoring...'); // Disable button and show status
+            try {
+                const db = await getDB();
+                const backup = await new Promise((resolve, reject) => {
+                    const transaction = db.transaction([STORE_NAME], 'readonly');
+                    
+                    transaction.onerror = (event) => {
+                        reject(event.target.error);
+                    };
+                    
+                    const store = transaction.objectStore(STORE_NAME);
+                    const request = store.get([chatKey, timestamp]);
+                    
+                    request.onsuccess = () => {
+                        resolve(request.result);
+                    };
+                    
+                    request.onerror = (event) => {
+                        reject(event.target.error);
+                    };
+                });
 
-                try {
-                    const db = await getDB();
-                    const backup = await new Promise((resolve, reject) => {
-                        const transaction = db.transaction([STORE_NAME], 'readonly');
-
-                        transaction.onerror = (event) => {
-                            reject(event.target.error);
-                        };
-
-                        const store = transaction.objectStore(STORE_NAME);
-                        const request = store.get([chatKey, timestamp]);
-
-                        request.onsuccess = () => {
-                            resolve(request.result);
-                        };
-
-                        request.onerror = (event) => {
-                            reject(event.target.error);
-                        };
-                    });
-
-                    if (backup) {
-                        if (confirm(`Are you sure you want to restore the backup for "${backup.entityName} - ${backup.chatName}"?\n\nThis will select the corresponding character/group and create a **NEW CHAT** to restore the backup content into.\n\nYour current chat content will NOT be lost, but please ensure it is saved.`)) {
-                            // restoreBackup function will handle its own toastr messages now
-                            await restoreBackup(backup);
-                        } else {
-                             // User cancelled the confirm dialog
-                             console.log('[聊天自动备份] Restore cancelled by user.');
-                        }
+                if (backup) {
+                    if (confirm(`确定要恢复 " ${backup.entityName} - ${backup.chatName} " 的备份吗？\n\n这将选中对应的角色/群组，并创建一个【新的聊天】来恢复备份内容。\n\n当前聊天内容不会丢失，但请确保已保存。`)) {
+                        await restoreBackup(backup);
                     } else {
-                        console.error('[聊天自动备份] Specified backup not found:', { timestamp, chatKey });
-                        toastr.error('Specified backup not found');
+                         // 用户取消确认对话框
+                         console.log('[聊天自动备份] 用户取消恢复操作');
+                    }
+                } else {
+                    console.error('[聊天自动备份] 找不到指定的备份:', { timestamp, chatKey });
+                    toastr.error('找不到指定的备份');
+                }
+            } catch (error) {
+                console.error('[聊天自动备份] 恢复过程中出错:', error);
+                toastr.error(`恢复过程中出错: ${error.message}`);
+            } finally {
+                button.prop('disabled', false).text('恢复'); // 恢复按钮状态
+            }
+        });
+
+        // 删除按钮
+        $(document).on('click', '.backup_delete', async function() {
+            const button = $(this);
+            const timestamp = parseInt(button.data('timestamp'));
+            const chatKey = button.data('key');
+            logDebug(`点击删除按钮, timestamp: ${timestamp}, chatKey: ${chatKey}`);
+
+            const backupItem = button.closest('.backup_item');
+            const entityName = backupItem.find('.backup_entity').text();
+            const chatName = backupItem.find('.backup_chat').text();
+            const date = backupItem.find('.backup_date').text();
+
+            if (confirm(`确定要永久删除这个备份吗？\n\n实体: ${entityName}\n聊天: ${chatName}\n时间: ${date}\n\n此操作无法撤销！`)) {
+                button.prop('disabled', true).text('删除中...');
+                try {
+                    await deleteBackup(chatKey, timestamp);
+                    toastr.success('备份已删除');
+                    backupItem.fadeOut(300, function() { $(this).remove(); }); // 平滑移除条目
+                    // 可选：如果列表为空，显示提示
+                    if ($('#chat_backup_list .backup_item').length <= 1) { // <=1 因为当前这个还在DOM里，将要移除
+                        updateBackupsList(); // 重新加载以显示"无备份"提示
                     }
                 } catch (error) {
-                    console.error('[聊天自动备份] Error occurred during restore process:', error);
-                    // restoreBackup already shows a toastr error for unexpected errors
-                } finally {
-                    button.prop('disabled', false).text('Restore'); // Restore button state
+                    console.error('[聊天自动备份] 删除备份失败:', error);
+                    toastr.error(`删除备份失败: ${error.message}`);
+                    button.prop('disabled', false).text('删除');
                 }
-            });
-
-
-            // Delete button (Keep unchanged)
-            // ... (delete button logic) ...
-            // (Copy the delete button logic from your provided index.js here)
-
-
-            // Preview button (Keep unchanged)
-            // ... (preview button logic) ...
-            // (Copy the preview button logic from your provided index.js here)
-
-
-            // Debug toggle (Keep unchanged)
-            $(document).on('change', '#chat_backup_debug_toggle', function() {
-                settings.debug = $(this).prop('checked');
-                console.log('[聊天自动备份] Debug mode ' + (settings.debug ? 'enabled' : 'disabled'));
-                saveSettingsDebounced();
-            });
-
-            // Initialize UI state (delay to ensure DOM is rendered)
-            setTimeout(async () => {
-                $('#chat_backup_debug_toggle').prop('checked', settings.debug);
-                $('#chat_backup_debounce_delay').val(settings.backupDebounceDelay);
-                $('#chat_backup_max_total').val(settings.maxTotalBackups);
-                await updateBackupsList();
-            }, 300);
-
-            // --- Set up optimized event listeners ---
-            function setupBackupEvents() {
-                // Events that trigger immediate backup (state is definitively finalized)
-                const immediateBackupEvents = [
-                    event_types.MESSAGE_SENT, // After user sends a message
-                    event_types.GENERATION_ENDED, // After AI generation finishes and message is added
-                    event_types.CHARACTER_FIRST_MESSAGE_SELECTED, // When selecting the first message of a character
-                ].filter(Boolean); // Filter out potentially undefined event types
-
-                // Events that trigger debounced backup (editing operations)
-                const debouncedBackupEvents = [
-                    event_types.MESSAGE_EDITED, // After editing a message (debounced)
-                    event_types.MESSAGE_DELETED, // After deleting a message (debounced)
-                    event_types.MESSAGE_SWIPED, // After user swipes AI reply (debounced)
-                    event_types.IMAGE_SWIPED, // Image swipe (debounced)
-                    event_types.MESSAGE_FILE_EMBEDDED, // File embedded (debounced)
-                    event_types.MESSAGE_REASONING_EDITED, // Edit reasoning (debounced)
-                    event_types.MESSAGE_REASONING_DELETED, // Delete reasoning (debounced)
-                    event_types.FILE_ATTACHMENT_DELETED, // Attachment deleted (debounced)
-                    event_types.GROUP_UPDATED, // Group metadata updated (debounced)
-                ].filter(Boolean);
-
-
-                console.log('[聊天自动备份] Setting up immediate backup event listeners:', immediateBackupEvents);
-                immediateBackupEvents.forEach(eventType => {
-                    if (!eventType) {
-                        console.warn('[聊天自动备份] Detected undefined immediate backup event type');
-                        return;
-                    }
-                    eventSource.on(eventType, () => {
-                        logDebug(`Event triggered (immediate backup): ${eventType}`);
-                        // Use the new conditional backup function
-                        performBackupConditional().catch(error => {
-                            console.error(`[聊天自动备份] Immediate backup event ${eventType} handling failed:`, error);
-                            // performBackupConditional already shows a toastr error
-                        });
-                    });
-                });
-
-                console.log('[聊天自动备份] Setting up debounced backup event listeners:', debouncedBackupEvents);
-                debouncedBackupEvents.forEach(eventType => {
-                    if (!eventType) {
-                        console.warn('[聊天自动备份] Detected undefined debounced backup event type');
-                        return;
-                    }
-                    eventSource.on(eventType, () => {
-                        logDebug(`Event triggered (debounced backup): ${eventType}`);
-                        // Use the new debounced backup function
-                        performBackupDebounced();
-                    });
-                });
-
-                console.log('[聊天自动备份] Event listeners setup complete');
             }
+        });
 
-            setupBackupEvents(); // Apply the new event binding logic
+        // 预览按钮
+        $(document).on('click', '.backup_preview_btn', async function() {
+            const button = $(this);
+            const timestamp = parseInt(button.data('timestamp'));
+            const chatKey = button.data('key');
+            logDebug(`点击预览按钮, timestamp: ${timestamp}, chatKey: ${chatKey}`);
 
-            // Listen for extensions page open event to refresh the list
-            $(document).on('click', '#extensionsMenuButton', () => {
-                // Check if the plugin's settings panel is visible when the menu button is clicked
-                if ($('#chat_auto_backup_settings').is(':visible')) {
-                    console.log('[聊天自动备份] Extensions menu button clicked, and plugin settings visible, refreshing backup list');
-                    setTimeout(updateBackupsList, 200); // Add a small delay to ensure panel content is loaded
-                }
-            });
+            button.prop('disabled', true).text('加载中...'); // 禁用按钮并显示状态
 
-            // Also refresh when the drawer is opened
-            $(document).on('click', '#chat_auto_backup_settings .inline-drawer-toggle', function() {
-                const drawer = $(this).closest('.inline-drawer');
-                // Check if the drawer is about to open (based on whether it currently has the 'open' class)
-                if (!drawer.hasClass('open')) {
-                    console.log('[聊天自动备份] Plugin settings drawer opening, refreshing backup list');
-                    setTimeout(updateBackupsList, 50); // Refresh almost immediately
-                }
-            });
+            try {
+                const db = await getDB();
+                const backup = await new Promise((resolve, reject) => {
+                    const transaction = db.transaction([STORE_NAME], 'readonly');
+                    
+                    transaction.onerror = (event) => {
+                        reject(event.target.error);
+                    };
+                    
+                    const store = transaction.objectStore(STORE_NAME);
+                    const request = store.get([chatKey, timestamp]);
+                    
+                    request.onsuccess = () => {
+                        resolve(request.result);
+                    };
+                    
+                    request.onerror = (event) => {
+                        reject(event.target.error);
+                    };
+                });
 
-
-            // Initial backup check (delayed execution to ensure chat is loaded)
-            setTimeout(async () => {
-                logDebug('[聊天自动备份] Performing initial backup check');
-                const context = getContext();
-                // Only attempt initial backup if there's chat data and no backup is in progress
-                if (context.chat && context.chat.length > 0 && !isBackupInProgress) {
-                    logDebug('[聊天自动备份] Found existing chat history, performing initial backup');
-                    try {
-                        await performBackupConditional(); // Use the conditional function
-                    } catch (error) {
-                        console.error('[聊天自动备份] Initial backup execution failed:', error);
-                        // performBackupConditional already shows a toastr error
-                    }
+                if (backup && backup.chat && backup.chat.length > 0) {
+                    // 获取最后两条消息
+                    const chat = backup.chat;
+                    const lastMessages = chat.slice(-2);
+                    
+                    // 过滤标签并处理Markdown
+                    const processMessage = (messageText) => {
+                        if (!messageText) return '(空消息)';
+                        
+                        // 过滤<think>和<thinking>标签及其内容
+                        let processed = messageText
+                            .replace(/<think>[\s\S]*?<\/think>/g, '')
+                            .replace(/<thinking>[\s\S]*?<\/thinking>/g, '');
+                        
+                        // 过滤代码块和白毛控名称
+                        processed = processed
+                            .replace(/```[\s\S]*?```/g, '')    // 移除代码块
+                            .replace(/`[\s\S]*?`/g, '');       // 移除内联代码
+                        
+                        // 简单的Markdown处理，保留部分格式
+                        processed = processed
+                            .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')  // 粗体
+                            .replace(/\*(.*?)\*/g, '<em>$1</em>')              // 斜体
+                            .replace(/\n\n+/g, '\n')                         // 多个连续换行替换为两个
+                            .replace(/\n/g, '<br>');                           // 换行
+                        
+                        return processed;
+                    };
+                    
+                    // 创建样式
+                    const style = document.createElement('style');
+                    style.textContent = `
+                        .message_box {
+                            padding: 10px;
+                            margin-bottom: 10px;
+                            border-radius: 8px;
+                            background: rgba(0, 0, 0, 0.15);
+                        }
+                        .message_sender {
+                            font-weight: bold;
+                            margin-bottom: 5px;
+                            color: var(--SmColor);
+                        }
+                        .message_content {
+                            white-space: pre-wrap;
+                            line-height: 1.4;
+                        }
+                        .message_content br + br {
+                            margin-top: 0.5em;
+                        }
+                    `;
+                    
+                    // 创建预览内容
+                    const previewContent = document.createElement('div');
+                    previewContent.appendChild(style);
+                    
+                    const headerDiv = document.createElement('h3');
+                    headerDiv.textContent = `${backup.entityName} - ${backup.chatName} 预览`;
+                    previewContent.appendChild(headerDiv);
+                    
+                    const contentDiv = document.createElement('div');
+                    
+                    // 为每条消息创建单独的盒子
+                    lastMessages.forEach(msg => {
+                        const messageBox = document.createElement('div');
+                        messageBox.className = 'message_box';
+                        
+                        const senderDiv = document.createElement('div');
+                        senderDiv.className = 'message_sender';
+                        senderDiv.textContent = msg.name || '未知';
+                        
+                        const contentDiv = document.createElement('div');
+                        contentDiv.className = 'message_content';
+                        contentDiv.innerHTML = processMessage(msg.mes);
+                        
+                        messageBox.appendChild(senderDiv);
+                        messageBox.appendChild(contentDiv);
+                        
+                        previewContent.appendChild(messageBox);
+                    });
+                    
+                    const footerDiv = document.createElement('div');
+                    footerDiv.style.marginTop = '10px';
+                    footerDiv.style.opacity = '0.7';
+                    footerDiv.style.fontSize = '0.9em';
+                    footerDiv.textContent = `显示最后 ${lastMessages.length} 条消息，共 ${chat.length} 条`;
+                    previewContent.appendChild(footerDiv);
+                    
+                    // 导入对话框系统
+                    const { callGenericPopup, POPUP_TYPE } = await import('../../../popup.js');
+                    
+                    // 使用系统弹窗显示预览内容
+                    await callGenericPopup(previewContent, POPUP_TYPE.DISPLAY, '', {
+                        wide: true,
+                        allowVerticalScrolling: true,
+                        leftAlign: true,
+                        okButton: '关闭'
+                    });
+                    
                 } else {
-                    logDebug('[聊天自动备份] No current chat history or backup in progress, skipping initial backup');
+                    console.error('[聊天自动备份] 找不到指定的备份或备份为空:', { timestamp, chatKey });
+                    toastr.error('找不到指定的备份或备份为空');
                 }
-            }, 4000); // A slightly longer delay to wait for the application to fully initialize
+            } catch (error) {
+                console.error('[聊天自动备份] 预览过程中出错:', error);
+                toastr.error(`预览过程中出错: ${error.message}`);
+            } finally {
+                button.prop('disabled', false).text('预览'); // 恢复按钮状态
+            }
+        });
 
-            console.log('[聊天自动备份] Plugin loading complete');
+        // 调试开关
+        $(document).on('change', '#chat_backup_debug_toggle', function() {
+            settings.debug = $(this).prop('checked');
+            console.log('[聊天自动备份] 调试模式已' + (settings.debug ? '启用' : '禁用'));
+            saveSettingsDebounced();
+        });
+        
+        // 监听扩展页面打开事件，刷新列表
+        $(document).on('click', '#extensionsMenuButton', () => {
+            if ($('#chat_auto_backup_settings').is(':visible')) {
+                console.log('[聊天自动备份] 扩展菜单按钮点击，且本插件设置可见，刷新备份列表');
+                setTimeout(updateBackupsList, 200); // 稍作延迟确保面板内容已加载
+            }
+        });
 
+        // 抽屉打开时也刷新
+        $(document).on('click', '#chat_auto_backup_settings .inline-drawer-toggle', function() {
+            const drawer = $(this).closest('.inline-drawer');
+            // 检查抽屉是否即将打开 (基于当前是否有 open class)
+            if (!drawer.hasClass('open')) {
+                console.log('[聊天自动备份] 插件设置抽屉打开，刷新备份列表');
+                setTimeout(updateBackupsList, 50); // 几乎立即刷新
+            }
+        });
+    };
+    
+    // 初始化UI状态
+    const initializeUIState = async () => {
+        console.log('[聊天自动备份] 初始化UI状态');
+        $('#chat_backup_debug_toggle').prop('checked', settings.debug);
+        $('#chat_backup_debounce_delay').val(settings.backupDebounceDelay);
+        $('#chat_backup_max_total').val(settings.maxTotalBackups);
+        await updateBackupsList();
+    };
+    
+    // 设置备份事件监听
+    const setupBackupEvents = () => {
+        console.log('[聊天自动备份] 设置备份事件监听');
+        
+        // 立即触发备份的事件 (状态明确结束)
+        const immediateBackupEvents = [
+            event_types.MESSAGE_SENT,           // 用户发送消息后
+            event_types.GENERATION_ENDED,       // AI生成完成并添加消息后
+            event_types.CHARACTER_FIRST_MESSAGE_SELECTED, // 选择角色第一条消息时                
+        ].filter(Boolean); // 过滤掉可能不存在的事件类型
+
+        // 触发防抖备份的事件 (编辑性操作)
+        const debouncedBackupEvents = [
+            event_types.MESSAGE_EDITED,        // 编辑消息后 (防抖)
+            event_types.MESSAGE_DELETED,       // 删除消息后 (防抖)
+            event_types.MESSAGE_SWIPED,         // 用户切换AI回复后 (防抖)
+            event_types.IMAGE_SWIPED,           // 图片切换 (防抖)
+            event_types.MESSAGE_FILE_EMBEDDED, // 文件嵌入 (防抖)
+            event_types.MESSAGE_REASONING_EDITED, // 编辑推理 (防抖)
+            event_types.MESSAGE_REASONING_DELETED, // 删除推理 (防抖)
+            event_types.FILE_ATTACHMENT_DELETED, // 附件删除 (防抖)
+            event_types.GROUP_UPDATED, // 群组元数据更新 (防抖)
+        ].filter(Boolean);
+
+        console.log('[聊天自动备份] 设置立即备份事件监听:', immediateBackupEvents);
+        immediateBackupEvents.forEach(eventType => {
+            if (!eventType) {
+                console.warn('[聊天自动备份] 检测到未定义的立即备份事件类型');
+                return;
+            }
+            eventSource.on(eventType, () => {
+                logDebug(`事件触发 (立即备份): ${eventType}`);
+                // 使用新的条件备份函数
+                performBackupConditional().catch(error => {
+                    console.error(`[聊天自动备份] 立即备份事件 ${eventType} 处理失败:`, error);
+                });
+            });
+        });
+
+        console.log('[聊天自动备份] 设置防抖备份事件监听:', debouncedBackupEvents);
+        debouncedBackupEvents.forEach(eventType => {
+            if (!eventType) {
+                console.warn('[聊天自动备份] 检测到未定义的防抖备份事件类型');
+                return;
+            }
+            eventSource.on(eventType, () => {
+                logDebug(`事件触发 (防抖备份): ${eventType}`);
+                // 使用新的防抖备份函数
+                performBackupDebounced();
+            });
+        });
+
+        console.log('[聊天自动备份] 事件监听器设置完成');
+    };
+    
+    // 执行初始备份检查
+    const performInitialBackupCheck = async () => {
+        console.log('[聊天自动备份] 执行初始备份检查');
+        try {
+            const context = getContext();
+            if (context.chat && context.chat.length > 0 && !isBackupInProgress) {
+                logDebug('[聊天自动备份] 发现现有聊天记录，执行初始备份');
+                await performBackupConditional(); // 使用条件函数
+            } else {
+                logDebug('[聊天自动备份] 当前没有聊天记录或备份进行中，跳过初始备份');
+            }
         } catch (error) {
-            console.error('[聊天自动备份] A serious error occurred during plugin loading:', error);
-            // Display error message on the UI
+            console.error('[聊天自动备份] 初始备份执行失败:', error);
+        }
+    };
+
+    // --- 主初始化函数 ---
+    const initializeExtension = async () => {
+        if (isInitialized) {
+            console.log('[聊天自动备份] 初始化已运行。跳过。');
+            return;
+        }
+        isInitialized = true;
+        console.log('[聊天自动备份] 由 app_ready 事件触发，运行初始化任务。');
+        
+        try {
+            // 顺序执行初始化任务
+            if (!await initializeDatabase()) {
+                console.warn('[聊天自动备份] 数据库初始化失败，但将尝试继续');
+            }
+            
+            initializeWebWorker();
+            
+            if (!await initializePluginUI()) {
+                console.warn('[聊天自动备份] 插件UI初始化失败，但将尝试继续');
+            }
+            
+            setupUIEvents();
+            setupBackupEvents();
+            
+            await initializeUIState();
+            
+            // 延迟一小段时间后执行初始备份检查，确保系统已经稳定
+            setTimeout(performInitialBackupCheck, 1000);
+            
+            console.log('[聊天自动备份] 插件加载完成');
+        } catch (error) {
+            console.error('[聊天自动备份] 插件加载过程中发生严重错误:', error);
             $('#extensions_settings').append(
-                '<div class="error">Chat Auto Backup plugin failed to load. Please check the console for details.</div>'
+                '<div class="error">聊天自动备份插件加载失败，请检查控制台。</div>'
             );
         }
-    });
+    };
 
-    // --- IndexedDB Functions (from your provided code) ---
-    // ... (Paste the IndexedDB functions here) ...
-    function initDatabase() {
-        return new Promise((resolve, reject) => {
-            logDebug('Initializing IndexedDB database');
-            const request = indexedDB.open(DB_NAME, DB_VERSION);
-
-            request.onerror = function(event) {
-                console.error('[聊天自动备份] Failed to open database:', event.target.error);
-                reject(event.target.error);
-            };
-
-            request.onsuccess = function(event) {
-                const db = event.target.result;
-                logDebug('Database opened successfully');
-                resolve(db);
-            };
-
-            request.onupgradeneeded = function(event) {
-                const db = event.target.result;
-                console.log('[聊天自动备份] Database upgrade needed, creating object store');
-                if (!db.objectStoreNames.contains(STORE_NAME)) {
-                    const store = db.createObjectStore(STORE_NAME, { keyPath: ['chatKey', 'timestamp'] });
-                    store.createIndex('chatKey', 'chatKey', { unique: false });
-                    console.log('[聊天自动备份] Created backup store and index');
-                }
-            };
-        });
-    }
-
-    async function getDB() {
-        try {
-            // Check if existing connection is available
-            if (dbConnection && dbConnection.readyState !== 'closed') {
-                return dbConnection;
+    // --- 监听SillyTavern的app_ready事件 ---
+    eventSource.on('app_ready', initializeExtension);
+    
+    // 如果事件已经错过，则直接初始化
+    if (window.SillyTavern?.appReady) {
+        console.log('[聊天自动备份] app_ready已发生，直接初始化');
+        initializeExtension();
+    } else {
+        console.log('[聊天自动备份] 等待app_ready事件触发初始化');
+        // 设置安全兜底，确保插件最终会初始化
+        setTimeout(() => {
+            if (!isInitialized) {
+                console.warn('[聊天自动备份] app_ready事件未触发，使用兜底机制初始化');
+                initializeExtension();
             }
-
-            // Create new connection
-            dbConnection = await initDatabase();
-            return dbConnection;
-        } catch (error) {
-            console.error('[聊天自动备份] Failed to get database connection:', error);
-            throw error;
-        }
-    }
-
-    async function saveBackupToDB(backup) {
-        const db = await getDB();
-        try {
-            await new Promise((resolve, reject) => {
-                const transaction = db.transaction([STORE_NAME], 'readwrite');
-
-                transaction.oncomplete = () => {
-                    logDebug(`Backup saved to IndexedDB, key: [${backup.chatKey}, ${backup.timestamp}]`);
-                    resolve();
-                };
-
-                transaction.onerror = (event) => {
-                    console.error('[聊天自动备份] Save backup transaction failed:', event.target.error);
-                    reject(event.target.error);
-                };
-
-                const store = transaction.objectStore(STORE_NAME);
-                store.put(backup);
-            });
-        } catch (error) {
-            console.error('[聊天自动备份] saveBackupToDB failed:', error);
-            throw error;
-        }
-    }
-
-    async function getBackupsForChat(chatKey) {
-        const db = await getDB();
-        try {
-            return await new Promise((resolve, reject) => {
-                const transaction = db.transaction([STORE_NAME], 'readonly');
-
-                transaction.onerror = (event) => {
-                    console.error('[聊天自动备份] Get backups transaction failed:', event.target.error);
-                    reject(event.target.error);
-                };
-
-                const store = transaction.objectStore(STORE_NAME);
-                const index = store.index('chatKey');
-                const request = index.getAll(chatKey);
-
-                request.onsuccess = () => {
-                    const backups = request.result || [];
-                    logDebug(`Retrieved ${backups.length} backups from IndexedDB, chatKey: ${chatKey}`);
-                    resolve(backups);
-                };
-
-                request.onerror = (event) => {
-                    console.error('[聊天自动备份] Failed to get backups:', event.target.error);
-                    reject(event.target.error);
-                };
-            });
-        } catch (error) {
-            console.error('[聊天自动备份] getBackupsForChat failed:', error);
-            return []; // Return empty array on error
-        }
-    }
-
-    async function getAllBackups() {
-        const db = await getDB();
-        try {
-            return await new Promise((resolve, reject) => {
-                const transaction = db.transaction([STORE_NAME], 'readonly');
-
-                transaction.onerror = (event) => {
-                    console.error('[聊天自动备份] Get all backups transaction failed:', event.target.error);
-                    reject(event.target.error);
-                };
-
-                const store = transaction.objectStore(STORE_NAME);
-                const request = store.getAll();
-
-                request.onsuccess = () => {
-                    const backups = request.result || [];
-                    logDebug(`Retrieved a total of ${backups.length} backups from IndexedDB`);
-                    resolve(backups);
-                };
-
-                request.onerror = (event) => {
-                    console.error('[聊天自动备份] Failed to get all backups:', event.target.error);
-                    reject(event.target.error);
-                };
-            });
-        } catch (error) {
-            console.error('[聊天自动备份] getAllBackups failed:', error);
-            return [];
-        }
-    }
-
-    async function getAllBackupKeys() {
-        const db = await getDB();
-        try {
-            return await new Promise((resolve, reject) => {
-                const transaction = db.transaction([STORE_NAME], 'readonly');
-
-                transaction.onerror = (event) => {
-                    console.error('[聊天自动备份] Get all backup keys transaction failed:', event.target.error);
-                    reject(event.target.error);
-                };
-
-                const store = transaction.objectStore(STORE_NAME);
-                // Use getAllKeys() to get only the keys
-                const request = store.getAllKeys();
-
-                request.onsuccess = () => {
-                    // The result is an array of keys, each key is [chatKey, timestamp]
-                    const keys = request.result || [];
-                    logDebug(`Retrieved a total of ${keys.length} backup keys from IndexedDB`);
-                    resolve(keys);
-                };
-
-                request.onerror = (event) => {
-                    console.error('[聊天自动备份] Failed to get all backup keys:', event.target.error);
-                    reject(event.target.error);
-                };
-            });
-        } catch (error) {
-            console.error('[聊天自动备份] getAllBackupKeys failed:', error);
-            return []; // Return empty array on error
-        }
-    }
-
-    async function deleteBackup(chatKey, timestamp) {
-        const db = await getDB();
-        try {
-            await new Promise((resolve, reject) => {
-                const transaction = db.transaction([STORE_NAME], 'readwrite');
-
-                transaction.oncomplete = () => {
-                    logDebug(`Deleted backup from IndexedDB, key: [${chatKey}, ${timestamp}]`);
-                    resolve();
-                };
-
-                transaction.onerror = (event) => {
-                    console.error('[聊天自动备份] Delete backup transaction failed:', event.target.error);
-                    reject(event.target.error);
-                };
-
-                const store = transaction.objectStore(STORE_NAME);
-                store.delete([chatKey, timestamp]);
-            });
-        } catch (error) {
-            console.error('[聊天自动备份] deleteBackup failed:', error);
-            throw error;
-        }
-    }
-
-    // --- Chat Info Functions (from your provided code) ---
-    // ... (Paste the chat info functions here) ...
-    function getCurrentChatKey() {
-        const context = getContext();
-        logDebug('Getting current chat identifier, context:',
-            {groupId: context.groupId, characterId: context.characterId, chatId: context.chatId});
-        if (context.groupId) {
-            const key = `group_${context.groupId}_${context.chatId}`;
-            logDebug('Current context is group chat, chatKey:', key);
-            return key;
-        } else if (context.characterId !== undefined && context.chatId) { // Ensure chatId exists
-            const key = `char_${context.characterId}_${context.chatId}`;
-            logDebug('Current context is character chat, chatKey:', key);
-            return key;
-        }
-        console.warn('[聊天自动备份] Could not get a valid identifier for the current chat (character/group or chat not selected)');
-        return null;
-    }
-
-    function getCurrentChatInfo() {
-        const context = getContext();
-        let chatName = 'Current Chat', entityName = 'Unknown';
-
-        if (context.groupId) {
-            const group = context.groups?.find(g => g.id === context.groupId);
-            entityName = group ? group.name : `Group ${context.groupId}`;
-            chatName = context.chatId || 'New Chat'; // Use a more explicit default name
-            logDebug('Retrieved group chat info:', {entityName, chatName});
-        } else if (context.characterId !== undefined) {
-            entityName = context.name2 || `Character ${context.characterId}`;
-            const character = context.characters?.[context.characterId];
-            if (character && context.chatId) {
-                 // Chat file name might contain a path, only take the last part
-                 const chatFile = character.chat || context.chatId;
-                 chatName = chatFile.substring(chatFile.lastIndexOf('/') + 1).replace('.jsonl', '');
-            } else {
-                chatName = context.chatId || 'New Chat';
-            }
-            logDebug('Retrieved character chat info:', {entityName, chatName});
-        } else {
-            console.warn('[聊天自动备份] Could not retrieve chat entity information, using defaults');
-        }
-
-        return { entityName, chatName };
+        }, 3000); // 3秒后如果仍未初始化，则强制初始化
     }
 });
